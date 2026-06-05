@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL database ────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: churn_db
+    environment:
+      POSTGRES_USER:     churn
+      POSTGRES_PASSWORD: churn
+      POSTGRES_DB:       churndb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U churn -d churndb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Seed + Train job (runs once, exits) ───────────────────────────────────
+  trainer:
+    build: .
+    container_name: churn_trainer
+    environment:
+      DATABASE_URL: postgresql://churn:churn@db:5432/churndb
+      MODEL_PATH:   /app/model/churn_model.pkl
+    volumes:
+      - model_artifact:/app/model
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo 'Waiting for DB...' &&
+        python seed_data.py &&
+        python train.py &&
+        echo 'Training complete.'
+      "
+    restart: "no"
+
+  # ── FastAPI prediction server ──────────────────────────────────────────────
+  api:
+    build: .
+    container_name: churn_api
+    environment:
+      DATABASE_URL: postgresql://churn:churn@db:5432/churndb
+      MODEL_PATH:   /app/model/churn_model.pkl
+    volumes:
+      - model_artifact:/app/model
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  model_artifact:
