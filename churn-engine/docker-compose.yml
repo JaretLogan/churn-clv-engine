@@ -58,6 +58,11 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+volumes:
+  postgres_data:
+  model_artifact:
+
+  # ── Frontend dashboard ──────────────────────────────────────────────────────
   frontend:
     image: nginx:alpine
     container_name: churn_frontend
@@ -69,7 +74,3 @@ services:
     depends_on:
       - api
     restart: unless-stopped
-
-volumes:
-  postgres_data:
-  model_artifact:

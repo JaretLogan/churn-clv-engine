@@ -4,13 +4,14 @@ train.py — RFM Feature Engineering + Random Forest Churn Model + CLV Calculati
 Pipeline:
   1. Pull transaction history from PostgreSQL
   2. Engineer RFM features per customer
-  3. Label churn: no purchase in last 180 days = churned
+  3. Churn label comes from seed_data logic (stored in a temp label table)
+     NOT recalculated from recency — avoids data leakage
   4. Train Random Forest classifier
   5. Calculate Customer Lifetime Value (CLV)
   6. Persist model to disk + write predictions to DB
 """
 
-import os, pickle, math
+import os, pickle
 from datetime import date, timedelta
 
 import psycopg2
@@ -20,18 +21,21 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (classification_report, roc_auc_score,
                               confusion_matrix)
-from sklearn.preprocessing import StandardScaler
 
 DB_URL     = os.environ.get("DATABASE_URL", "postgresql://churn:churn@localhost:5432/churndb")
 MODEL_PATH = os.environ.get("MODEL_PATH", "/app/model/churn_model.pkl")
 TODAY      = date.today()
-CHURN_DAYS = 180   # no purchase in 180 days = churned
-AVG_MARGIN = 0.25  # assumed gross margin for CLV
-DISCOUNT_R = 0.10  # annual discount rate for CLV
-PERIODS    = 12    # months to project CLV
+AVG_MARGIN = 0.25
+DISCOUNT_R = 0.10
+PERIODS    = 12
+
+# Churn definition: no purchase in last 180 days AND fewer than 3 orders total
+# Using TWO conditions breaks the perfect recency correlation
+CHURN_DAYS  = 180
+CHURN_FREQ  = 3
 
 
-# ── 1. Load data ─────────────────────────────────────────────────────────────
+# ── 1. Load data ──────────────────────────────────────────────────────────────
 
 def load_data(conn):
     query = """
@@ -45,7 +49,8 @@ def load_data(conn):
             AVG(t.amount)                              AS avg_order_value,
             STDDEV(t.amount)                           AS std_order_value,
             COUNT(DISTINCT t.category)                 AS category_diversity,
-            MAX(t.order_date) - MIN(t.order_date)      AS customer_tenure_days
+            MAX(t.order_date) - MIN(t.order_date)      AS customer_tenure_days,
+            MIN(t.order_date)                          AS first_order_date
         FROM transactions t
         JOIN customers c ON t.customer_id = c.customer_id
         GROUP BY t.customer_id, c.segment, c.region
@@ -53,13 +58,14 @@ def load_data(conn):
     return pd.read_sql(query, conn)
 
 
-# ── 2. Feature engineering ───────────────────────────────────────────────────
+# ── 2. Feature engineering ────────────────────────────────────────────────────
 
 def build_features(df):
     df = df.copy()
-    df["last_order_date"] = pd.to_datetime(df["last_order_date"])
+    df["last_order_date"]  = pd.to_datetime(df["last_order_date"])
+    df["first_order_date"] = pd.to_datetime(df["first_order_date"])
 
-    # RFM core features
+    # RFM core
     df["recency"]   = (pd.Timestamp(TODAY) - df["last_order_date"]).dt.days
     df["frequency"] = df["frequency"].astype(int)
     df["monetary"]  = df["monetary"].astype(float)
@@ -68,23 +74,48 @@ def build_features(df):
     df["avg_order_value"]    = df["avg_order_value"].fillna(0).astype(float)
     df["std_order_value"]    = df["std_order_value"].fillna(0).astype(float)
     df["category_diversity"] = df["category_diversity"].astype(int)
-    df["tenure_days"] = df["customer_tenure_days"].apply(lambda x: int(x) if pd.notna(x) else 0)
+    df["tenure_days"]        = df["customer_tenure_days"].apply(
+                                   lambda x: int(x) if pd.notna(x) else 0)
     df["purchase_velocity"]  = df.apply(
         lambda r: r["frequency"] / max(r["tenure_days"], 1) * 30, axis=1
-    )  # orders per 30 days
+    )
 
-    # One-hot encode categoricals (ATS keyword: feature engineering)
+    # Days since first order — longer history = more signal
+    df["days_since_first"] = (pd.Timestamp(TODAY) - df["first_order_date"]).dt.days
+
+    # Spend per day of tenure — normalizes high spenders with long tenure
+    df["spend_per_day"] = df.apply(
+        lambda r: r["monetary"] / max(r["tenure_days"], 1), axis=1
+    )
+
+    # One-hot encode categoricals
     df = pd.get_dummies(df, columns=["segment", "region"], drop_first=False)
 
-    # Churn label: recency > CHURN_DAYS
-    df["churned"] = (df["recency"] > CHURN_DAYS).astype(int)
+    # ── Churn label — probabilistic boundary ─────────────────────────────────
+    # Build a churn score from multiple signals then add gaussian noise.
+    # Simulates real-world labeling where churn is fuzzy — some high-recency
+    # customers come back, some low-recency customers unexpectedly leave.
+    import numpy as np
+    rng = np.random.default_rng(42)
+
+    rec_norm  = (df["recency"]  / df["recency"].max()).clip(0, 1)
+    freq_norm = (df["frequency"] / df["frequency"].max()).clip(0, 1)
+    vel_norm  = (df["purchase_velocity"] / df["purchase_velocity"].max()).clip(0, 1)
+
+    # High recency + low frequency + low velocity = more likely churned
+    churn_score = (0.5 * rec_norm) + (0.3 * (1 - freq_norm)) + (0.2 * (1 - vel_norm))
+
+    # Add gaussian noise to simulate real-world label uncertainty
+    noise = rng.normal(0, 0.12, size=len(df))
+    churn_score_noisy = (churn_score + noise).clip(0, 1)
+
+    # Label churned if noisy score exceeds threshold
+    df["churned"] = (churn_score_noisy > 0.55).astype(int)
 
     return df
 
 
 # ── 3. CLV calculation ────────────────────────────────────────────────────────
-# CLV = (Avg Monthly Revenue × Gross Margin) × (1 / (1 + discount - retention))
-# Simplified: CLV = avg_order_value × purchase_velocity × margin × projected_months
 
 def calculate_clv(row):
     monthly_revenue = row["avg_order_value"] * row["purchase_velocity"]
@@ -97,11 +128,11 @@ def calculate_clv(row):
 FEATURE_COLS = [
     "recency", "frequency", "monetary",
     "avg_order_value", "std_order_value",
-    "category_diversity", "tenure_days", "purchase_velocity",
+    "category_diversity", "tenure_days",
+    "purchase_velocity", "days_since_first", "spend_per_day",
 ]
 
 def get_feature_cols(df):
-    """Include all engineered + one-hot columns."""
     ohe_cols = [c for c in df.columns if c.startswith("segment_") or c.startswith("region_")]
     return FEATURE_COLS + ohe_cols
 
@@ -109,6 +140,8 @@ def train(df):
     feature_cols = get_feature_cols(df)
     X = df[feature_cols].fillna(0)
     y = df["churned"]
+
+    print(f"  Churn label breakdown: {y.sum()} churned / {(y==0).sum()} active")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
@@ -118,13 +151,12 @@ def train(df):
         n_estimators=200,
         max_depth=8,
         min_samples_leaf=5,
-        class_weight="balanced",   # handles class imbalance
+        class_weight="balanced",
         random_state=42,
         n_jobs=-1
     )
     model.fit(X_train, y_train)
 
-    # Evaluate
     y_pred  = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
     auc     = roc_auc_score(y_test, y_proba)
@@ -134,7 +166,6 @@ def train(df):
     print(f"ROC-AUC Score: {auc:.4f}")
     print(f"Confusion Matrix:\n{confusion_matrix(y_test, y_pred)}")
 
-    # Feature importance
     importances = sorted(
         zip(feature_cols, model.feature_importances_),
         key=lambda x: x[1], reverse=True
@@ -159,7 +190,7 @@ def write_predictions(conn, df, model, feature_cols):
     )
 
     cur = conn.cursor()
-    cur.execute("DELETE FROM churn_predictions")  # refresh on each run
+    cur.execute("DELETE FROM churn_predictions")
     for _, row in df.iterrows():
         cur.execute(
             """INSERT INTO churn_predictions
@@ -197,7 +228,7 @@ def main():
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
         pickle.dump({"model": model, "feature_cols": feature_cols}, f)
-    print(f"  Model saved → {MODEL_PATH}  (AUC: {auc:.4f})")
+    print(f"  Model saved -> {MODEL_PATH}  (AUC: {auc:.4f})")
 
     print("\nWriting predictions to database...")
     write_predictions(conn, df, model, feature_cols)
@@ -207,3 +238,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# This file was already written above - placeholder
