@@ -184,23 +184,3 @@ docker compose run --rm trainer python train.py
 The API container automatically picks up the updated model artifact from the shared volume on its next request.
 
 ---
-
-## Resume Bullet Points
-
-```
-Predictive Customer Churn & CLV Engine | Python, PostgreSQL, Scikit-Learn, FastAPI, Docker
-
-• Engineered an 8-feature RFM (Recency, Frequency, Monetary) dataset from raw transactional
-  SQL data using Pandas/NumPy, including derived features (purchase velocity, spend volatility,
-  category diversity) to improve model signal.
-
-• Trained a Random Forest classifier (200 estimators, class_weight="balanced") to predict
-  customer churn probability, achieving ROC-AUC > 0.85 on a held-out 20% test set.
-
-• Operationalized the model as a production RESTful API using FastAPI — POST a customer's
-  raw transaction history, receive churn probability, risk tier, and 12-month CLV projection
-  as a structured JSON response.
-
-• Containerized the full pipeline (PostgreSQL + training job + API server) using Docker Compose,
-  enabling one-command reproducible deployment across any environment.
-```
