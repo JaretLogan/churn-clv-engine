@@ -1,8 +1,8 @@
 # Customer Churn & CLV Prediction Engine
 
-**Tech Stack:** Python · PostgreSQL · Scikit-Learn · FastAPI · Docker · Docker Compose
+**Stack:** Python · PostgreSQL · Scikit-Learn · FastAPI · Docker Compose
 
-A production-style machine learning system that ingests customer transaction history, engineers RFM (Recency, Frequency, Monetary) features, trains a Random Forest classifier to predict customer churn probability, calculates Customer Lifetime Value (CLV), and exposes the model as a live RESTful API endpoint.
+Takes raw customer transaction history, engineers RFM features, predicts churn probability with a trained Random Forest, calculates 12-month Customer Lifetime Value, and serves everything through a live REST API.
 
 ---
 
@@ -27,39 +27,34 @@ A production-style machine learning system that ingests customer transaction his
 ```
 
 **Data flow:**
-1. `seed_data.py` generates 300 customers + realistic transaction history, inserts into PostgreSQL
-2. `train.py` pulls data via SQL, engineers 8 RFM features, trains a Random Forest (200 trees), writes predictions back to DB
-3. FastAPI loads the serialized model on startup and serves live inference via `/predict`
+1. `seed_data.py` generates 300 customers + realistic transaction history → PostgreSQL
+2. `train.py` pulls via SQL, engineers 8 RFM features, trains Random Forest (200 trees), writes predictions back to DB
+3. FastAPI loads the serialized model on startup and serves live inference at `/predict`
 
 ---
 
 ## Quickstart
 
-**Prerequisites:** Docker + Docker Compose installed.
+**Prerequisites:** Docker + Docker Compose
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/JaretLogan/churn-engine
-cd churn-engine
+git clone https://github.com/JaretLogan/churn-clv-engine
+cd churn-clv-engine
 
-# 2. Start everything (DB → seed → train → API)
 docker compose up --build
-
-# 3. Wait ~30 seconds for training to complete, then hit the API
-curl http://localhost:8000/
 ```
 
-The API is live at **http://localhost:8000**
-Interactive docs at **http://localhost:8000/docs**
+Wait ~30 seconds for training to complete. API is live at **http://localhost:8000**, interactive docs at **http://localhost:8000/docs**.
 
-> **Note:** The `trainer` container runs once and exits — that's expected. The `api` container stays running.
+> The `trainer` container exits after one run — that's expected. Only the `api` container stays up.
 
 ---
 
-## API Endpoints
+## API
 
 ### `POST /predict`
-Score any customer from raw transaction history. No customer_id required — works on new/unknown customers.
+
+Score any customer from raw transaction history. No stored customer_id required.
 
 ```bash
 curl -X POST http://localhost:8000/predict \
@@ -76,7 +71,6 @@ curl -X POST http://localhost:8000/predict \
   }'
 ```
 
-**Response:**
 ```json
 {
   "customer_id":  "CUST-NEW-001",
@@ -93,94 +87,77 @@ curl -X POST http://localhost:8000/predict \
 }
 ```
 
-### `GET /customers/{id}/prediction`
-Fetch the stored prediction for a trained customer.
-```bash
-curl http://localhost:8000/customers/CUST-0001/prediction
-```
+### Other endpoints
 
-### `GET /analytics/summary`
-Risk tier breakdown across all 300 customers.
-```bash
-curl http://localhost:8000/analytics/summary
-```
+| Endpoint | Description |
+|---|---|
+| `GET /customers/{id}/prediction` | Stored prediction for a trained customer |
+| `GET /analytics/summary` | Risk tier breakdown across all 300 customers |
+| `GET /analytics/top-risk?limit=10` | Top N highest churn-risk customers |
 
-### `GET /analytics/top-risk?limit=10`
-Top N highest churn-risk customers.
-```bash
-curl http://localhost:8000/analytics/top-risk?limit=10
+---
+
+## ML Details
+
+### Features
+
+| Feature | Description |
+|---|---|
+| `recency` | Days since last purchase |
+| `frequency` | Total number of orders |
+| `monetary` | Total lifetime spend |
+| `avg_order_value` | Mean spend per transaction |
+| `std_order_value` | Spend volatility |
+| `category_diversity` | Distinct product categories purchased |
+| `tenure_days` | Days from first to last purchase |
+| `purchase_velocity` | Orders per 30 days |
+
+Categorical features (`segment`, `region`) are one-hot encoded to match training schema.
+
+### Model
+
+Random Forest (200 trees, max_depth=8, `class_weight="balanced"` for ~30% churn minority). ROC-AUC evaluated on 20% holdout each training run. Model serialized to `/app/model/churn_model.pkl`, shared between containers via Docker volume.
+
+### Churn definition
+
+Customer is labeled churned if most recent purchase > 180 days ago. Configurable via `CHURN_DAYS` in `train.py`.
+
+### CLV formula
+
+```
+CLV = (Avg Monthly Revenue × Gross Margin × 12) / (1 + Monthly Discount Rate)
+
+Avg Monthly Revenue = avg_order_value × purchase_velocity
+Gross Margin        = 0.25  (configurable)
+Annual Discount     = 0.10
 ```
 
 ---
 
-## ML Pipeline Details
+## Retrain
 
-### Feature Engineering (RFM + Derived)
-
-| Feature              | Description                              |
-|----------------------|------------------------------------------|
-| `recency`            | Days since last purchase                 |
-| `frequency`          | Total number of orders                   |
-| `monetary`           | Total lifetime spend                     |
-| `avg_order_value`    | Mean spend per transaction               |
-| `std_order_value`    | Spend consistency (volatility)           |
-| `category_diversity` | # of distinct product categories bought |
-| `tenure_days`        | Days from first to last purchase         |
-| `purchase_velocity`  | Orders per 30 days (frequency / tenure)  |
-
-Categorical features (`segment`, `region`) are one-hot encoded to match training column schema.
-
-### Churn Label Definition
-A customer is labeled **churned** if their most recent purchase is > 180 days ago. This threshold is configurable via `CHURN_DAYS` in `train.py`.
-
-### Model
-- **Algorithm:** Random Forest Classifier (200 trees, max_depth=8)
-- **Class balancing:** `class_weight="balanced"` handles the ~30% churn minority class
-- **Evaluation:** ROC-AUC score printed on each training run
-- **Serialization:** Pickled to `/app/model/churn_model.pkl`, shared between containers via Docker volume
-
-### CLV Formula
+```bash
+docker compose run --rm trainer python train.py
 ```
-CLV = (Avg Monthly Revenue × Gross Margin × Projected Months)
-          / (1 + Monthly Discount Rate)
 
-where:
-  Avg Monthly Revenue = avg_order_value × purchase_velocity
-  Gross Margin        = 0.25 (configurable)
-  Projected Months    = 12
-  Annual Discount Rate = 0.10
-```
+The API picks up the updated model artifact from the shared volume on its next request.
 
 ---
 
 ## Project Structure
 
 ```
-churn-engine/
+churn-clv-engine/
 ├── app/
-│   ├── main.py              # FastAPI application + endpoints
-│   └── requirements.txt     # Python dependencies
+│   ├── main.py              # FastAPI app + endpoints
+│   └── requirements.txt
 ├── data/
 │   └── seed_data.py         # Data generation + PostgreSQL seeding
 ├── model/
-│   └── train.py             # RFM engineering + RF training + CLV
+│   └── train.py             # Feature engineering + RF training + CLV
 ├── sql/
-│   └── init.sql             # PostgreSQL schema (auto-runs on DB start)
-├── Dockerfile               # App + trainer container
-├── docker-compose.yml       # Orchestrates DB + trainer + API
+│   └── init.sql             # Schema (auto-runs on DB start)
+├── Dockerfile
+├── docker-compose.yml
 └── README.md
 ```
-
----
-
-## Retrain on New Data
-
-To retrain the model after adding new transactions:
-
-```bash
-docker compose run --rm trainer python train.py
-```
-
-The API container automatically picks up the updated model artifact from the shared volume on its next request.
-
----
